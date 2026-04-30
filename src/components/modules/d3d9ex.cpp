@@ -9,6 +9,18 @@ namespace components
 	extern void mirror_dump_inc_pscf();
 	extern void mirror_dump_inc_draw();
 
+	// v35.8.1 diagnostic: monotonic frame counter for HUD-mirror logging.
+	// Independent of /mirror_dump file capture; events are written to console.log
+	// whenever r_mirrorViewmodel_log >= 2, including across grenade-damage frames
+	// where the user cannot type /mirror_dump in time.
+	static unsigned int s_hudlog_frame = 0;
+
+	static inline int hudlog_level()
+	{
+		return dvars::r_mirrorViewmodel_log
+			? dvars::r_mirrorViewmodel_log->current.integer : 0;
+	}
+
 	// ----------------------------------------------------------------------
 	// r_mirrorViewmodel: render-to-texture mirror.
 	//
@@ -58,6 +70,23 @@ namespace components
 		// rejects that early-c7 (no fire), while still arming on a real
 		// post-FX c7 that fires AFTER the gun pass (HUD captures normally).
 		static bool g_dhp_seen_this_frame           = false;
+		// v35.12: snapshot of g_dhp_seen_this_frame from the PREVIOUS frame.
+		// Latched on BeginScene before the per-frame reset. Used by mirror_hud
+		// PSCF c7 arming gate to ACCEPT c7 in death-cam frames where there is
+		// no gun pass at all (dhp_seen stays false the whole frame). v35.8
+		// alone rejects those, leaving the HUD un-mirrored during the entire
+		// ~3-second death animation. Discriminator:
+		//   damage early c7 : prev_dhp=true,  this_dhp=false at c7 -> REJECT
+		//   death cam   c7  : prev_dhp=false, this_dhp=false at c7 -> ACCEPT
+		//   normal      c7  : this_dhp=true (gun rendered) -> ACCEPT (v35.8)
+		static bool g_dhp_seen_prev_frame           = false;
+		// v35.11: full per-frame counters for dhp / segment / inject events
+		// (the v35.8/v35.10 booleans were too coarse to detect anomalies).
+		static int  g_dhp_count_this_frame          = 0;
+		static int  g_begin_seg_count_this_frame    = 0;
+		static int  g_end_seg_count_this_frame      = 0;
+		static int  g_inject_calls_this_frame       = 0;
+		static int  g_inject_ok_count_this_frame    = 0;
 
 		// v32: full-screen mirror (`r_fullMirror`).
 		//   0 = off
@@ -113,6 +142,7 @@ namespace components
 				g_pass_active = true;
 			}
 			g_in_segment = true;
+			++g_begin_seg_count_this_frame; // v35.11
 		}
 
 		// Switch back to engine's color+depth so post-viewmodel world draws are visible.
@@ -125,6 +155,7 @@ namespace components
 			if (g_saved_color) { dev->SetRenderTarget(0, g_saved_color); g_saved_color->Release(); g_saved_color = nullptr; }
 			if (g_saved_depth) { dev->SetDepthStencilSurface(g_saved_depth); g_saved_depth->Release(); g_saved_depth = nullptr; }
 			else                 dev->SetDepthStencilSurface(nullptr);
+			++g_end_seg_count_this_frame; // v35.11
 		}
 
 		// v33 (ported from cod4mirror): rewrite main depth-stencil at the
@@ -223,6 +254,7 @@ namespace components
 
 		static bool inject_into_tonemap_source(IDirect3DDevice9* dev)
 		{
+			++g_inject_calls_this_frame; // v35.11 (count includes pre-checks)
 			if (g_in_segment) end_segment(dev);
 			if (!g_pass_active) return false;
 
@@ -341,6 +373,7 @@ namespace components
 				// during damage flash (when g_pass_active was false at entry
 				// and inject returned ok=false at the !g_pass_active early-out).
 				g_final_composite_done_this_frame = true;
+				++g_inject_ok_count_this_frame; // v35.11
 			}
 			return ok;
 		}
@@ -632,6 +665,72 @@ namespace components
 		static int  g_rt_redirects_this_frame        = 0;     // SetRenderTarget(0,X) intercepted while g_active
 		static int  g_composite_calls_this_frame     = 0;     // composite() invocations
 		static int  g_alphatest_fires_this_frame     = 0;     // v35.2: ALPHATESTENABLE=TRUE that fired begin_capture
+		// v35.8.1 diagnostic counters: per-frame breakdown of c7 fingerprint
+		// matches by arming-gate outcome.
+		//   match    : total PSCF c7 calls whose values pass the (-x,-x,-x,gamma) shape
+		//   armed    : matches that ALSO had mirror_rtt::g_dhp_seen_this_frame=true
+		//              (i.e. arming gate accepted, capture would fire on next ALPHATESTENABLE)
+		//   rejected : matches with dhp_seen=false (early/pre-gun c7, gate rejected -- HUD
+		//              will NOT capture this frame, HUD ends up un-mirrored)
+		static int  g_c7_match_this_frame            = 0;
+		static int  g_c7_armed_this_frame            = 0;
+		static int  g_c7_rejected_this_frame         = 0;
+		// v35.9 diagnostic+fix: count dhp uploads that arrive AFTER
+		// mirror_hud HUD-RTT capture has started (g_active=true). In
+		// damage frames the engine emits a second gun pass after
+		// begin_capture; mirror_rtt re-binds its off-screen RT through
+		// the underlying device (bypassing our SetRenderTarget hook),
+		// then end_segment restores HUD-RTT. The mirrored gun then
+		// gets composited into HUD-RTT at EndScene (mirror_rtt::final_
+		// composite blits onto whatever RT is bound), and mirror_hud::
+		// composite() flips it horizontally on the back-buffer -- the
+		// gun appears double-flipped (un-mirrored) for ~2s. The fix in
+		// EndScene restores the BB before final_composite to prevent
+		// this; this counter is purely for damage-frame verification.
+		static int  g_late_dhp_this_frame            = 0;
+		// v35.10 diagnostic counters. Goal: find the mechanism that
+		// makes the gun appear UN-mirrored for ~2s during damage flash
+		// when r_hudMirror=1. v35.9 hypothesis (late dhp upload after
+		// begin_capture) was REFUTED by user log: late_dhp=0, rt=0 in
+		// all 654 frames. Plus user tested flipFollow=9999 -- bug
+		// persists, so VSCF flip-window exhaustion is also not it.
+		// These counters track other suspect events:
+		static int  g_inj_fail_this_frame            = 0; // inject_into_tonemap_source returned false (fallback to pending_early_composite)
+		static int  g_early_comp_this_frame          = 0; // pending_early_composite triggered final_composite from Draw[Indexed]Primitive
+		static int  g_comp_during_hud_this_frame     = 0; // final_composite ran while HUD-RTT was bound (g_active=true)
+		static int  g_draws_during_hud_this_frame    = 0; // Draw[Indexed]Primitive while g_active=true (post-capture rendering volume)
+		static int  g_mtx_flipreg_during_hud_this_frame = 0; // VSCF 4-row matrix upload at flipReg while g_active=true (suspected gun re-render)
+		// v35.15: shader-draw escape mechanism for HUD-RTT.
+		// During the damage flash / death cam a fullscreen post-FX
+		// draw can run between begin_capture and the first real HUD
+		// draw. With HUD-RTT bound that quad would write INTO HUD-RTT;
+		// composite() then UV-flips HUD-RTT onto BB so the sampled
+		// scene appears mirrored (the world-flip bug). The escape
+		// detects this draw via the stage-0 texture (a large render-
+		// target sized >= 512) and redirects it to g_saved_color (BB)
+		// for the duration of that single draw, then HUD-RTT is
+		// re-bound.
+		static bool g_last_tex0_is_big_rt                   = false;
+		static int  g_shader_escapes_this_frame             = 0;
+		static bool g_logged_first_shader_escape_this_frame = false;
+
+		// KNOWN LIMITATION: at r_hudMirror=1 the killstreak / nickname
+		// outline shader (custom VS+PS, sabe=TRUE, srca=INVDESTALPHA,
+		// dsta=ZERO, stencil disabled) renders into HUD-RTT with a
+		// visibly bolder dark outline than at r_hudMirror=0. Three
+		// alpha-math fix attempts (v35.16 SEPARATEALPHABLENDENABLE
+		// global, v35.19 SetRenderState alpha-factor override, v35.20
+		// per-draw alpha-factor force) all failed: v35.20 did fire on
+		// every outline draw (43-68/frame in user log) but produced
+		// no visible change, and v35.16 / v35.20 also leaked state
+		// into world / gun rendering and broke weapon visibility
+		// during fire. v35.21 stencil hypothesis was also refuted by
+		// log (STENCILENABLE=0 in all 983 outline draws). The visible
+		// difference is probably caused by a stage>0 sampler or a
+		// shader constant that depends on RT identity, but verifying
+		// would require deeply invasive shader-resource inspection.
+		// Current behaviour kept: full HUD mirror including outline
+		// text, with cosmetic bolder outline as a known limitation.
 
 		static void release_targets()
 		{
@@ -1037,9 +1136,48 @@ namespace components
 		// HUD draws until mirror_rtt::final_composite has actually run
 		// for this frame (or rtt is disabled, see ALPHATESTENABLE hook).
 		mirror_rtt::g_final_composite_done_this_frame = false;
+		// v35.12: latch previous-frame dhp_seen BEFORE we clear this-frame.
+		// Read by mirror_hud c7 arming gate to relax v35.8 in death cam.
+		mirror_rtt::g_dhp_seen_prev_frame = mirror_rtt::g_dhp_seen_this_frame;
 		// v35.8: clear the per-frame "dhp seen" latch. Set at SVP when
 		// the engine first uploads a depth-hack-projection (gun) matrix.
 		mirror_rtt::g_dhp_seen_this_frame = false;
+		mirror_rtt::g_dhp_count_this_frame       = 0; // v35.11
+		mirror_rtt::g_begin_seg_count_this_frame = 0; // v35.11
+		mirror_rtt::g_end_seg_count_this_frame   = 0; // v35.11
+		mirror_rtt::g_inject_calls_this_frame    = 0; // v35.11
+		mirror_rtt::g_inject_ok_count_this_frame = 0; // v35.11
+
+		// v35.8.1 diagnostic: reset HUD-RTT per-frame counters here so values
+		// represent ONLY the current frame even when /mirror_dump is OFF. The
+		// previous code reset only inside the dump-active block in EndScene,
+		// so the FIRST captured frame inherited accumulated counts from every
+		// prior frame since process start (visible as bogus pscf_hits=2359 in
+		// frame 0 of mirror_dump_20260428_015927.txt). Reset at frame START is
+		// authoritative.
+		mirror_hud::g_pscf_hits_this_frame       = 0;
+		mirror_hud::g_alphatest_fires_this_frame = 0;
+		mirror_hud::g_begin_calls_this_frame     = 0;
+		mirror_hud::g_rt_redirects_this_frame    = 0;
+		mirror_hud::g_composite_calls_this_frame = 0;
+
+		// v35.8.1 diagnostic counters (cumulative within this frame, used for
+		// the EndScene log line). Tracked separately from existing dump
+		// counters so we can attribute c7 fingerprint matches that were
+		// rejected by the v35.8 dhp_seen arming gate vs ones that armed.
+		mirror_hud::g_c7_match_this_frame      = 0;
+		mirror_hud::g_c7_armed_this_frame      = 0;
+		mirror_hud::g_c7_rejected_this_frame   = 0;
+		mirror_hud::g_late_dhp_this_frame      = 0;
+		mirror_hud::g_inj_fail_this_frame             = 0;
+		mirror_hud::g_early_comp_this_frame           = 0;
+		mirror_hud::g_comp_during_hud_this_frame      = 0;
+		mirror_hud::g_draws_during_hud_this_frame     = 0;
+		mirror_hud::g_mtx_flipreg_during_hud_this_frame = 0;
+		mirror_hud::g_shader_escapes_this_frame              = 0;     // v35.15
+		mirror_hud::g_logged_first_shader_escape_this_frame  = false; // v35.15
+
+		++s_hudlog_frame;
 
 		if (_renderer::mirror_dump_active())
 		{
@@ -1057,7 +1195,35 @@ namespace components
 		// for the first segment) and produced the "ghost" appearance.
 		if (mirror_rtt::g_pass_active || mirror_rtt::g_in_segment)
 		{
-			mirror_rtt::final_composite(m_pIDirect3DDevice9);
+			// v35.9 fix: in damage frames the engine emits a SECOND gun
+			// pass AFTER mirror_hud::begin_capture has bound HUD-RTT. The
+			// gun renders into mirror_rtt::g_color, end_segment restores
+			// HUD-RTT (since begin_segment captured it as the saved RT),
+			// and final_composite below would blit the mirrored gun into
+			// HUD-RTT. mirror_hud::composite() then flips HUD-RTT to BB,
+			// double-flipping the gun (gun appears UN-mirrored on screen
+			// for ~2s during the damage flash). Restore BB binding here
+			// so final_composite blits gun onto BB directly, then re-bind
+			// HUD-RTT so mirror_hud::composite() at line below has the
+			// expected state. Normal frames take the else branch since
+			// inject_into_tonemap_source already set g_pass_active=false
+			// during post-FX (this whole if-block is skipped), so v35.9
+			// is a no-op outside the damage path.
+			if (mirror_hud::g_active && mirror_hud::g_saved_color)
+			{
+				// v35.10 diagnostic: this is the v35.9 BB-restore path. Count
+				// it whenever mirror_rtt has a pending gun pass at EndScene
+				// while HUD-RTT is bound -- the bug-trigger condition.
+				if (mirror_rtt::g_pass_active || mirror_rtt::g_in_segment)
+					++mirror_hud::g_comp_during_hud_this_frame;
+				m_pIDirect3DDevice9->SetRenderTarget(0, mirror_hud::g_saved_color);
+				mirror_rtt::final_composite(m_pIDirect3DDevice9);
+				m_pIDirect3DDevice9->SetRenderTarget(0, mirror_hud::g_color);
+			}
+			else
+			{
+				mirror_rtt::final_composite(m_pIDirect3DDevice9);
+			}
 		}
 
 		// v35: HUD-RTT composite. If r_hudMirror==1 the HUD pass was
@@ -1091,6 +1257,108 @@ namespace components
 		// (v35 HUD-RTT path replaces v34 VSCF projection-flip path).
 		_renderer::gun_seen_this_present = false;
 		mirror_hud::g_capture_armed = false;
+
+		// v35.8.1 diagnostic: per-frame HUD-mirror summary to console.log
+		// (independent of /mirror_dump). Gated on r_mirrorViewmodel_log>=2 so
+		// it can run during a real grenade-damage frame -- the user cannot type
+		// /mirror_dump fast enough to catch the 2-second damage flash.
+		//   c7      : total c7 fingerprint matches
+		//   armed   : matches that passed dhp_seen gate (would arm capture)
+		//   reject  : matches rejected by gate (HUD will not capture)
+		//   fire    : ALPHATESTENABLE=TRUE that fired begin_capture
+		//   beg     : successful begin_capture invocations
+		//   comp    : composite() invocations
+		//   dhp     : g_dhp_seen_this_frame at EndScene
+		//   final   : g_final_composite_done_this_frame at EndScene
+		//   hud_act : g_active at EndScene (HUD-RTT was bound)
+		//   late_dhp: v35.9 -- dhp uploads after begin_capture (>=1 in damage
+		//             frames; trigger for the v35.9 EndScene fix)
+		//   rt      : v35.9 -- SetRenderTarget redirects to HUD-RTT this frame
+		//   inj_fail: v35.10 -- inject_into_tonemap_source returned false
+		//             (fallback to pending_early_composite path)
+		//   early_comp: v35.10 -- pending_early_composite consumed by Draw
+		//   comp_in_hud: v35.10 -- final_composite ran while HUD-RTT bound
+		//             (this is the v35.9 fix's trigger condition; should
+		//             be 0 in normal frames; non-zero in damage means the
+		//             v35.9 BB-restore path was taken at EndScene)
+		//   draws_in_hud: v35.10 -- Draw[Indexed]Primitive while HUD-RTT
+		//             bound. Higher in damage frames would point at extra
+		//             rendering happening into HUD-RTT (post-capture work).
+		//   mtx64_in_hud: v35.10 -- VSCF 4-row matrix upload at flipReg
+		//             while HUD-RTT bound. >=1 strongly suggests a stealth
+		//             gun re-render after begin_capture: the gun matrix is
+		//             flipped, gun renders into HUD-RTT, composite() flips
+		//             horizontally, double-flip => un-mirrored gun on BB.
+		//   dhp_n   : v35.11 -- total dhp_upload events this frame (>1 means
+		//             multiple gun-pass starts, e.g. damage flinch re-render)
+		//   bsg/esg : v35.11 -- begin_segment/end_segment call counts
+		//   inj     : v35.11 -- inject_into_tonemap_source ok/total counts
+		//   follow_end: v35.11 -- mirror_vscf_follow_remaining at SUMMARY
+		//             (should be 0 if gun pass fully resolved; non-zero =>
+		//             flip-window left armed past end of gun pass)
+		//   pass_end: v35.11 -- mirror_rtt::g_pass_active at SUMMARY
+		//             (should be 0 if final_composite ran; 1 => gun pass
+		//             never composited, scheduled for EndScene fallback)
+		if (hudlog_level() >= 2)
+		{
+			// v35.11: print a one-shot snapshot of mirror-related dvars the
+			// first time hudlog is active. Verifies the test config matches
+			// expectations (rtt, mirrorFx, hudMirror, flipReg, flipFollow).
+			static bool s_dvar_snapshot_emitted = false;
+			if (!s_dvar_snapshot_emitted)
+			{
+				s_dvar_snapshot_emitted = true;
+				const auto iv = [](game::dvar_s* d){ return d ? d->current.integer : -1; };
+				game::Com_PrintMessage(0, utils::va(
+					"[hudlog] DVAR SNAPSHOT r_hudMirror=%d r_mirrorViewmodel_rtt=%d "
+					"method=%d mirrorFx=%d flipReg=%d flipFollow=%d flipVSCF=%d "
+					"depthFix=%d cullFix=%d rttBlend=%d rttTonemapInject=%d\n",
+					iv(dvars::r_hudMirror),
+					iv(dvars::r_mirrorViewmodel_rtt),
+					iv(dvars::r_mirrorViewmodel_method),
+					iv(dvars::r_mirrorViewmodel_mirrorFx),
+					iv(dvars::r_mirrorViewmodel_flipReg),
+					iv(dvars::r_mirrorViewmodel_flipFollow),
+					iv(dvars::r_mirrorViewmodel_flipVSCF),
+					iv(dvars::r_mirrorViewmodel_depthFix),
+					iv(dvars::r_mirrorViewmodel_cullFix),
+					iv(dvars::r_mirrorViewmodel_rttBlend),
+					iv(dvars::r_mirrorViewmodel_rttTonemapInject)), 0);
+			}
+			game::Com_PrintMessage(0, utils::va(
+				"[hudlog] f=%u SUMMARY c7=%d armed=%d reject=%d fire=%d beg=%d comp=%d "
+				"dhp=%d final=%d hud_act=%d late_dhp=%d rt=%d "
+				"inj_fail=%d early_comp=%d comp_in_hud=%d draws_in_hud=%d mtx64_in_hud=%d "
+				"dhp_n=%d bsg=%d esg=%d inj=%d/%d follow_end=%d pass_end=%d prev_dhp=%d "
+				"esc=%d\n",
+				s_hudlog_frame,
+				mirror_hud::g_c7_match_this_frame,
+				mirror_hud::g_c7_armed_this_frame,
+				mirror_hud::g_c7_rejected_this_frame,
+				mirror_hud::g_alphatest_fires_this_frame,
+				mirror_hud::g_begin_calls_this_frame,
+				mirror_hud::g_composite_calls_this_frame,
+				(int)mirror_rtt::g_dhp_seen_this_frame,
+				(int)mirror_rtt::g_final_composite_done_this_frame,
+				(int)mirror_hud::g_active,
+				mirror_hud::g_late_dhp_this_frame,
+				mirror_hud::g_rt_redirects_this_frame,
+				mirror_hud::g_inj_fail_this_frame,
+				mirror_hud::g_early_comp_this_frame,
+				mirror_hud::g_comp_during_hud_this_frame,
+				mirror_hud::g_draws_during_hud_this_frame,
+				mirror_hud::g_mtx_flipreg_during_hud_this_frame,
+				mirror_rtt::g_dhp_count_this_frame,
+				mirror_rtt::g_begin_seg_count_this_frame,
+				mirror_rtt::g_end_seg_count_this_frame,
+				mirror_rtt::g_inject_ok_count_this_frame,
+				mirror_rtt::g_inject_calls_this_frame,
+				_renderer::mirror_vscf_follow_remaining,
+				(int)mirror_rtt::g_pass_active,
+				(int)mirror_rtt::g_dhp_seen_prev_frame,
+				mirror_hud::g_shader_escapes_this_frame),   // v35.15
+				0);
+		}
 
 		if (_renderer::mirror_dump_frames_remaining > 0)
 		{
@@ -1276,7 +1544,23 @@ namespace components
 			mirror_hud::g_capture_armed = false;
 			++mirror_hud::g_alphatest_fires_this_frame;
 			mirror_hud::begin_capture(m_pIDirect3DDevice9);
+			// v35.8.1 diagnostic: log begin_capture fire (HUD-RTT capture starting).
+			if (hudlog_level() >= 2)
+			{
+				game::Com_PrintMessage(0, utils::va(
+					"[hudlog] f=%u fire begin_capture (alpha_fire=%d beg=%d)\n",
+					s_hudlog_frame,
+					mirror_hud::g_alphatest_fires_this_frame,
+					mirror_hud::g_begin_calls_this_frame), 0);
+			}
 		}
+		// v35.20: SetRenderState override removed -- v35.19 log showed
+		// ablend_ovr=0 every frame because the engine sets SRCBLENDALPHA
+		// / DESTBLENDALPHA via a state block (CreateStateBlock + Apply)
+		// rather than individual SetRenderState calls. Override moved
+		// into Draw[Indexed]Primitive to guarantee it fires immediately
+		// before the outline-shader draw regardless of how the values
+		// got onto the device.
 		const DWORD original_value = Value;
 		bool swapped = false;
 
@@ -1365,6 +1649,26 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::SetTexture(DWORD Stage, IDirect3DBaseTexture9* pTexture)
 	{
+		// v35.15: classify stage-0 texture as 'big RT' (e.g. scene RT used
+		// by the damage/death post-FX pass). Drives the narrowed shader-
+		// escape in Draw[Indexed]Primitive. Normal HUD textures are
+		// DXT5 D3DUSAGE_DYNAMIC (0x200) so this stays false during HUD.
+		if (Stage == 0)
+		{
+			bool is_big_rt = false;
+			if (pTexture && pTexture->GetType() == D3DRTYPE_TEXTURE)
+			{
+				IDirect3DTexture9* tex2d = static_cast<IDirect3DTexture9*>(pTexture);
+				D3DSURFACE_DESC sd = {};
+				if (SUCCEEDED(tex2d->GetLevelDesc(0, &sd))
+					&& sd.Width >= 512u
+					&& (sd.Usage & D3DUSAGE_RENDERTARGET) != 0)
+				{
+					is_big_rt = true;
+				}
+			}
+			mirror_hud::g_last_tex0_is_big_rt = is_big_rt;
+		}
 		return m_pIDirect3DDevice9->SetTexture(Stage, pTexture);
 	}
 
@@ -1445,6 +1749,35 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount)
 	{
+		// v35.10 diagnostic: count draws emitted while HUD-RTT is bound.
+		// In normal frames the HUD pass after begin_capture only draws
+		// 2D HUD elements; in damage frames a higher count or new VSCF
+		// matrix uploads at flipReg would point at a stealth gun render.
+		if (mirror_hud::g_active) {
+			++mirror_hud::g_draws_during_hud_this_frame;
+		}
+		// v35.15: narrowed escape -- only redirect draws that sample a
+		// large RENDERTARGET texture at stage 0 (the post-FX scene RT).
+		// v35.14 used (vs_nonnull || ps_nonnull) which also matched HUD
+		// draws in this engine (shader set before begin_capture), so the
+		// entire HUD was bypassed -> HUD mirror broke. The RT-texture
+		// signal is exclusive to damage/death post-FX in v35.13 log.
+		const bool v35_14_escape_dp =
+			mirror_hud::g_active
+			&& mirror_hud::g_last_tex0_is_big_rt
+			&& mirror_hud::g_saved_color;
+		if (v35_14_escape_dp) {
+			++mirror_hud::g_shader_escapes_this_frame;
+			if (!mirror_hud::g_logged_first_shader_escape_this_frame && hudlog_level() >= 2) {
+				mirror_hud::g_logged_first_shader_escape_this_frame = true;
+				game::Com_PrintMessage(0, utils::va(
+					"[hudlog] f=%u shader_escape kind=dp prim=%u tex0_rt=1\n",
+					s_hudlog_frame, PrimitiveCount), 0);
+			}
+			m_pIDirect3DDevice9->SetRenderTarget(0, mirror_hud::g_saved_color);
+			if (mirror_hud::g_saved_depth)
+				m_pIDirect3DDevice9->SetDepthStencilSurface(mirror_hud::g_saved_depth);
+		}
 		if (_renderer::mirror_dump_active())
 		{
 			mirror_dump_inc_draw();
@@ -1453,12 +1786,18 @@ namespace components
 				PrimitiveCount, _renderer::mirror_vscf_follow_remaining);
 		}
 		HRESULT hr = m_pIDirect3DDevice9->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+		if (v35_14_escape_dp) {
+			m_pIDirect3DDevice9->SetRenderTarget(0, mirror_hud::g_color);
+			m_pIDirect3DDevice9->SetDepthStencilSurface(nullptr);
+		}
 		if (mirror_rtt::g_pending_early_composite)
 		{
 			mirror_rtt::g_pending_early_composite = false;
 			if (mirror_rtt::g_pass_active || mirror_rtt::g_in_segment)
 			{
 				if (mirror_rtt::g_in_segment) mirror_rtt::end_segment(m_pIDirect3DDevice9);
+				++mirror_hud::g_early_comp_this_frame; // v35.10
+				if (mirror_hud::g_active) ++mirror_hud::g_comp_during_hud_this_frame; // v35.10
 				mirror_rtt::final_composite(m_pIDirect3DDevice9);
 			}
 		}
@@ -1480,6 +1819,28 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount)
 	{
+		if (mirror_hud::g_active) {
+			++mirror_hud::g_draws_during_hud_this_frame; // v35.10
+		}
+		// v35.15: narrowed escape (see DrawPrimitive comment). Only
+		// redirect draws that sample a large RENDERTARGET texture at
+		// stage 0 -- the post-FX scene RT signature.
+		const bool v35_14_escape_dip =
+			mirror_hud::g_active
+			&& mirror_hud::g_last_tex0_is_big_rt
+			&& mirror_hud::g_saved_color;
+		if (v35_14_escape_dip) {
+			++mirror_hud::g_shader_escapes_this_frame;
+			if (!mirror_hud::g_logged_first_shader_escape_this_frame && hudlog_level() >= 2) {
+				mirror_hud::g_logged_first_shader_escape_this_frame = true;
+				game::Com_PrintMessage(0, utils::va(
+					"[hudlog] f=%u shader_escape kind=dip prim=%u nverts=%u tex0_rt=1\n",
+					s_hudlog_frame, primCount, NumVertices), 0);
+			}
+			m_pIDirect3DDevice9->SetRenderTarget(0, mirror_hud::g_saved_color);
+			if (mirror_hud::g_saved_depth)
+				m_pIDirect3DDevice9->SetDepthStencilSurface(mirror_hud::g_saved_depth);
+		}
 		if (_renderer::mirror_dump_active())
 		{
 			mirror_dump_inc_draw();
@@ -1488,6 +1849,10 @@ namespace components
 				primCount, NumVertices, _renderer::mirror_vscf_follow_remaining);
 		}
 		HRESULT hr = m_pIDirect3DDevice9->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+		if (v35_14_escape_dip) {
+			m_pIDirect3DDevice9->SetRenderTarget(0, mirror_hud::g_color);
+			m_pIDirect3DDevice9->SetDepthStencilSurface(nullptr);
+		}
 		// v22: composite the mirrored viewmodel right AFTER the engine's
 		// final tonemap/output draw (the first draw following the PSCF c7
 		// fingerprint). The pending flag was set by SetPixelShaderConstantF.
@@ -1497,6 +1862,8 @@ namespace components
 			if (mirror_rtt::g_pass_active || mirror_rtt::g_in_segment)
 			{
 				if (mirror_rtt::g_in_segment) mirror_rtt::end_segment(m_pIDirect3DDevice9);
+				++mirror_hud::g_early_comp_this_frame; // v35.10
+				if (mirror_hud::g_active) ++mirror_hud::g_comp_during_hud_this_frame; // v35.10
 				mirror_rtt::final_composite(m_pIDirect3DDevice9);
 			}
 		}
@@ -1620,7 +1987,52 @@ namespace components
 			// mirror_hud's PSCF c7 arming gate to reject the early/false
 			// damage-flash c7 fingerprint that fires before any dhp
 			// upload; only post-gun (real post-FX) c7 fingerprints arm.
+			const bool dhp_was_seen = mirror_rtt::g_dhp_seen_this_frame;
 			mirror_rtt::g_dhp_seen_this_frame = true;
+			++mirror_rtt::g_dhp_count_this_frame; // v35.11
+
+			// v35.8.1 diagnostic: log only on FIRST dhp upload of the frame
+			// (subsequent dhp uploads in the same frame would spam the log).
+			if (!dhp_was_seen && hudlog_level() >= 2)
+			{
+				game::Com_PrintMessage(0, utils::va(
+					"[hudlog] f=%u dhp_upload (first) pass_active=%d in_seg=%d final_done=%d c7_match_so_far=%d c7_rejected_so_far=%d\n",
+					s_hudlog_frame,
+					(int)mirror_rtt::g_pass_active,
+					(int)mirror_rtt::g_in_segment,
+					(int)mirror_rtt::g_final_composite_done_this_frame,
+					mirror_hud::g_c7_match_this_frame,
+					mirror_hud::g_c7_rejected_this_frame), 0);
+				// v35.12: dump first dhp matrix diagonal + first column to detect
+				// horizontal flip (negative c0[0] would mean engine pre-flipped
+				// the gun matrix, which combined with our inject UV-flip would
+				// produce un-mirrored gun on BB during damage flinch).
+				game::Com_PrintMessage(0, utils::va(
+					"[hudlog] f=%u dhp_mtx c0=(%.4f %.4f %.4f %.4f) c1[1]=%.4f c2[2]=%.4f c2[3]=%.4f c3=(%.4f %.4f %.4f %.4f)\n",
+					s_hudlog_frame,
+					pConstantData[0],  pConstantData[1],  pConstantData[2],  pConstantData[3],
+					pConstantData[5],
+					pConstantData[10],
+					pConstantData[11],
+					pConstantData[12], pConstantData[13], pConstantData[14], pConstantData[15]
+				), 0);
+			}
+
+			// v35.9 diagnostic: dhp uploads that arrive AFTER mirror_hud
+			// HUD-RTT capture has started. These are the "second gun pass"
+			// in damage frames that drive the EndScene double-flip bug; the
+			// EndScene fix below covers them. Counter is reported in SUMMARY.
+			if (mirror_hud::g_active)
+			{
+				++mirror_hud::g_late_dhp_this_frame;
+				if (hudlog_level() >= 2)
+				{
+					game::Com_PrintMessage(0, utils::va(
+						"[hudlog] f=%u dhp_upload (LATE, after begin_capture) late_dhp=%d\n",
+						s_hudlog_frame,
+						mirror_hud::g_late_dhp_this_frame), 0);
+				}
+			}
 		}
 		else if (is_std_proj)
 		{
@@ -1664,6 +2076,13 @@ namespace components
 		// a gun pass (dhp itself, or within follow window when flipVSCF==2).
 		// When rtt is on, the off-screen render path replaces matrix-flip; disable it.
 		const bool is_target_mtx = (pConstantData && Vector4fCount == 4 && (int)StartRegister == flipReg);
+		// v35.10 diagnostic: count gun-matrix-shape uploads (4-row at flipReg)
+		// that arrive while HUD-RTT capture is in progress. If non-zero in
+		// damage frames, a stealth gun re-render is happening with the HUD
+		// RT bound -- the matrix-flipped gun would land on HUD-RTT, then
+		// composite() flips horizontally, double-flipping it (un-mirrored).
+		if (is_target_mtx && mirror_hud::g_active)
+			++mirror_hud::g_mtx_flipreg_during_hud_this_frame;
 		bool apply_flip = false;
 		if (is_target_mtx && flipVSCF != 0 && !rtt_on)
 		{
@@ -1920,6 +2339,8 @@ namespace components
 					// instead set a pending flag so we composite AFTER that draw.
 					if (mirror_rtt::g_in_segment) mirror_rtt::end_segment(m_pIDirect3DDevice9);
 					mirror_rtt::g_pending_early_composite = true;
+					// v35.10 diagnostic: inject failed -> fallback active
+					++mirror_hud::g_inj_fail_this_frame;
 				}
 			}
 		}
@@ -1981,8 +2402,34 @@ namespace components
 				// matches even if some were rejected.
 				if (is_pre_hud_signal) {
 					++mirror_hud::g_pscf_hits_this_frame;
-					if (mirror_rtt::g_dhp_seen_this_frame) {
+					++mirror_hud::g_c7_match_this_frame;
+					// v35.12: arm if (a) gun pass already happened this frame
+					// (v35.8 normal case), OR (b) previous frame also had no
+					// gun pass (sustained death cam: 3rd-person view, no
+					// viewmodel ever uploads dhp). Damage-flash early c7
+					// (prev frame had gun, current dhp not yet seen) is still
+					// rejected because the real post-FX c7 will arm shortly.
+					const bool armed_now =
+						mirror_rtt::g_dhp_seen_this_frame ||
+						!mirror_rtt::g_dhp_seen_prev_frame;
+					if (armed_now) {
 						mirror_hud::g_capture_armed = true;
+						++mirror_hud::g_c7_armed_this_frame;
+					} else {
+						++mirror_hud::g_c7_rejected_this_frame;
+					}
+					// v35.8.1 diagnostic: log every c7 fingerprint match with arming
+					// gate outcome. "armed" = will fire begin_capture on next
+					// ALPHATESTENABLE=TRUE; "rejected" = early/pre-gun c7 dropped
+					// by v35.8 gate (HUD will NOT capture this c7).
+					if (hudlog_level() >= 2)
+					{
+						game::Com_PrintMessage(0, utils::va(
+							"[hudlog] f=%u c7_match c=(%.6f %.6f %.6f %.6f) dhp_seen=%d prev_dhp=%d -> %s\n",
+							s_hudlog_frame, c70, c71, c72, c73,
+							(int)mirror_rtt::g_dhp_seen_this_frame,
+							(int)mirror_rtt::g_dhp_seen_prev_frame,
+							armed_now ? "ARMED" : "REJECTED"), 0);
 					}
 				}
 			}
