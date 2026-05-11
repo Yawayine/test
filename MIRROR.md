@@ -212,3 +212,5 @@ Blend-мод композ-итa. Default `2` = ONE/ONE additive, обычно п
 | v29 | trampoline 8 байт (фикс краша на стрельбе) |
 | v31 | RH-mirror axis mode 2 (фикс дрейфа гильз при повороте) |
 | v32 | `r_fullMirror` для полного flip-а кадра |
+| v36 | `r_fullMirrorDepth` — flip main DSV вслед за color при `r_fullMirror 1/2` (фикс ghost MXAO/SSAO в ReShade) |
+| v37 | расширенный PSCF c7 fingerprint + RGB-gated PS-pointer cache — гун снова получает filmtweak/grading при произвольных `r_filmTweakBrightness/Contrast/Desaturation`, `r_contrast`, `r_desaturation`, включая комбо за расширенными границами. Эволюция: v37.0 — cache без проверки RGB → ghost на fullMirror/hudMirror; v37.1 — cache снят → экзотические комбо снова отваливались; **v37.2** — cache возвращён, но требует `c70==c71==c72` в fallback-ветке → secondary post-FX пассы с `(3.78,4.00,3.56,1.00)` корректно отвергаются |
