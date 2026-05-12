@@ -1157,6 +1157,182 @@ namespace components
 		}
 	}
 
+	// ----------------------------------------------------------------------
+	// v38 diag: blur-pass tracing. Helps locate the engine render target that
+	// r_blur composites onto our flipped back-buffer (producing a ghost layer
+	// at r_fullMirror==1). Active only while r_mirrorViewmodel_logBlur > 0.
+	// ----------------------------------------------------------------------
+	namespace mirror_blur_diag
+	{
+		static int g_frame_no            = 0;   // increments on Present (or EndScene fallback)
+		static int g_call_no_in_frame    = 0;   // increments on each instrumented call
+		static int g_log_lines_this_frame = 0;  // capped to avoid spam
+		static bool g_present_seen_this_frame = false;  // dedupe Present/EndScene fallback
+		static bool g_post_flip_this_frame    = false;  // gates verbose per-draw at level 2
+		static constexpr int kMaxLinesPerFrame = 2000;  // bumped: level=2 needs headroom
+
+		// forward declaration (definition below alongside SRS trackers).
+		static void srs_reset_for_frame();
+
+		static inline int log_level()
+		{
+			if (!dvars::r_mirrorViewmodel_logBlur) return 0;
+			return dvars::r_mirrorViewmodel_logBlur->current.integer;
+		}
+
+		// r_blur is a float dvar in iw3; report it as float so 0.5 doesn't look like 0.
+		static inline float r_blur_value()
+		{
+			game::dvar_s* d = game::Dvar_FindVar("r_blur");
+			return (d ? d->current.value : 0.0f);
+		}
+
+		static inline int r_fullMirror_value()
+		{
+			return dvars::r_fullMirror ? dvars::r_fullMirror->current.integer : 0;
+		}
+
+		static void log_event_str(const char* tag, const char* body)
+		{
+			if (log_level() <= 0) return;
+			// flipBB / flipDSV mark the moment our v36 flip ran; level=2
+			// per-draw log uses this latch to ONLY log draws that happen
+			// AFTER the flip (those are the candidates for r_blur ghosting).
+			if (tag && tag[0] == 'f' && tag[1] == 'l' && tag[2] == 'i' && tag[3] == 'p')
+				g_post_flip_this_frame = true;
+			if (g_log_lines_this_frame >= kMaxLinesPerFrame) return;
+			++g_log_lines_this_frame;
+			++g_call_no_in_frame;
+			game::Com_PrintMessage(0, utils::va("[blur] f=%d c=%d %s %s\n",
+				g_frame_no, g_call_no_in_frame, tag, body ? body : ""), 0);
+		}
+
+		// frame boundary. Called from Present() AND from EndScene() (fallback,
+		// because some iw3 dispatch paths route Present() around our wrapper).
+		// The first call per frame emits the marker + advances frame counter;
+		// subsequent calls within the same frame no-op.
+		static void on_present(const char* site)
+		{
+			if (g_present_seen_this_frame) return;
+			g_present_seen_this_frame = true;
+			if (log_level() > 0)
+			{
+				game::Com_PrintMessage(0, utils::va(
+					"[blur] === present frame=%d site=%s r_blur=%g r_fullMirror=%d events=%d ===\n",
+					g_frame_no, site ? site : "?", r_blur_value(), r_fullMirror_value(),
+					g_call_no_in_frame), 0);
+			}
+			++g_frame_no;
+			g_call_no_in_frame    = 0;
+			g_log_lines_this_frame = 0;
+			g_post_flip_this_frame = false;
+		}
+
+		// reset the per-frame "present seen" flag at frame start (BeginScene).
+		static void on_begin_scene()
+		{
+			g_present_seen_this_frame = false;
+			// v38.1: invalidate SRS last-value cache so we always log the
+			// first state set after each BeginScene (even if value matches
+			// last frame's final value).
+			srs_reset_for_frame();
+		}
+
+		static void log_draw(IDirect3DDevice9* dev, const char* api, UINT primCount, UINT numVerts)
+		{
+			if (log_level() < 2) return;
+			// only log draws AFTER our v36 flip fired this frame --
+			// pre-flip draws are not interesting for the r_blur ghost.
+			if (!g_post_flip_this_frame) return;
+			if (g_log_lines_this_frame >= kMaxLinesPerFrame) return;
+			IDirect3DBaseTexture9* tex0 = nullptr;
+			if (dev) dev->GetTexture(0, &tex0);
+			IDirect3DPixelShader9* ps = nullptr;
+			if (dev) dev->GetPixelShader(&ps);
+			log_event_str("draw", utils::va("%s prim=%u nv=%u tex0=%p ps=%p",
+				api, primCount, numVerts, (void*)tex0, (void*)ps));
+			if (tex0) tex0->Release();
+			if (ps)   ps->Release();
+		}
+
+		// v38.1 diagnostic: SetRenderState change tracker. iw3 spams the same
+		// render state many times per frame, so we only log when the value
+		// CHANGES. Goal: identify a uniquely-HUD-start render-state signal
+		// (PR #8 assumed ALPHATESTENABLE=TRUE was unique to HUD start, but
+		// motion-blur composite seems to toggle it too -- need to see which
+		// state(s) actually flip ONLY at HUD boundary when blur is active).
+		struct srs_last_t { DWORD value; bool valid; };
+		static srs_last_t g_srs_last_alphatest    = {0, false};
+		static srs_last_t g_srs_last_alphablend   = {0, false};
+		static srs_last_t g_srs_last_zenable      = {0, false};
+		static srs_last_t g_srs_last_zwriteenable = {0, false};
+		static srs_last_t g_srs_last_srcblend     = {0, false};
+		static srs_last_t g_srs_last_destblend    = {0, false};
+		static srs_last_t g_srs_last_cullmode     = {0, false};
+
+		static void log_srs(const char* name, srs_last_t& slot, DWORD value)
+		{
+			if (log_level() <= 0) return;
+			if (slot.valid && slot.value == value) return; // no change -> skip
+			slot.value = value; slot.valid = true;
+			log_event_str("SRS", utils::va("%s=%u", name, (unsigned)value));
+		}
+
+		static void on_set_render_state(D3DRENDERSTATETYPE State, DWORD Value)
+		{
+			if (log_level() <= 0) return;
+			switch (State)
+			{
+			case D3DRS_ALPHATESTENABLE:   log_srs("ALPHATESTENABLE",  g_srs_last_alphatest,    Value); break;
+			case D3DRS_ALPHABLENDENABLE:  log_srs("ALPHABLENDENABLE", g_srs_last_alphablend,   Value); break;
+			case D3DRS_ZENABLE:           log_srs("ZENABLE",          g_srs_last_zenable,      Value); break;
+			case D3DRS_ZWRITEENABLE:      log_srs("ZWRITEENABLE",     g_srs_last_zwriteenable, Value); break;
+			case D3DRS_SRCBLEND:          log_srs("SRCBLEND",         g_srs_last_srcblend,     Value); break;
+			case D3DRS_DESTBLEND:         log_srs("DESTBLEND",        g_srs_last_destblend,    Value); break;
+			case D3DRS_CULLMODE:          log_srs("CULLMODE",         g_srs_last_cullmode,     Value); break;
+			default: break;
+			}
+		}
+
+		// per-frame reset for SRS tracking. Call from on_begin_scene so the
+		// first state set after a new frame still gets logged even if it
+		// happens to equal last frame's final value.
+		static void srs_reset_for_frame()
+		{
+			g_srs_last_alphatest.valid    = false;
+			g_srs_last_alphablend.valid   = false;
+			g_srs_last_zenable.valid      = false;
+			g_srs_last_zwriteenable.valid = false;
+			g_srs_last_srcblend.valid     = false;
+			g_srs_last_destblend.valid    = false;
+			g_srs_last_cullmode.valid     = false;
+		}
+
+		// stage-0 texture tracker. Only logs on CHANGE, only AFTER flipBB
+		// (post-flip phase is where the ghost is generated -- pre-flip
+		// stage-0 sets are noise from world rendering).
+		static IDirect3DBaseTexture9* g_last_tex0 = nullptr;
+		static void on_set_texture0(IDirect3DBaseTexture9* tex)
+		{
+			if (log_level() < 2) return;
+			if (!g_post_flip_this_frame) return;
+			if (tex == g_last_tex0) return;
+			g_last_tex0 = tex;
+			log_event_str("Tex0", utils::va("tex=%p", (void*)tex));
+		}
+
+		static const char* describe_surface(IDirect3DSurface9* surf)
+		{
+			if (!surf) return "null";
+			D3DSURFACE_DESC desc{};
+			if (FAILED(surf->GetDesc(&desc)))
+				return utils::va("%p ???", (void*)surf);
+			return utils::va("%p %ux%u fmt=%u usage=0x%x pool=%u",
+				(void*)surf, desc.Width, desc.Height,
+				(unsigned)desc.Format, (unsigned)desc.Usage, (unsigned)desc.Pool);
+		}
+	}
+
 #pragma region D3D9Device
 
 	HRESULT d3d9ex::D3D9Device::QueryInterface(REFIID riid, void** ppvObj)
@@ -1268,6 +1444,7 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::Present(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion)
 	{
+		mirror_blur_diag::on_present("Present");
 		// r_mirrorViewmodel: clear the viewmodel flag at frame boundary so next
 		// frame's world pass isn't rendered with inverted culling.
 		// NOTE: EndScene owns the dump-frame counter. Some IW3 dispatch paths route
@@ -1374,6 +1551,14 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::StretchRect(IDirect3DSurface9* pSourceSurface, CONST RECT* pSourceRect, IDirect3DSurface9* pDestSurface, CONST RECT* pDestRect, D3DTEXTUREFILTERTYPE Filter)
 	{
+		if (mirror_blur_diag::log_level() >= 1)
+		{
+			mirror_blur_diag::log_event_str("StretchRect", utils::va(
+				"src=[%s] dst=[%s] filter=%d",
+				mirror_blur_diag::describe_surface(pSourceSurface),
+				mirror_blur_diag::describe_surface(pDestSurface),
+				(int)Filter));
+		}
 		return m_pIDirect3DDevice9->StretchRect(pSourceSurface, pSourceRect, pDestSurface, pDestRect, Filter);
 	}
 
@@ -1391,6 +1576,11 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9* pRenderTarget)
 	{
+		if (RenderTargetIndex == 0 && mirror_blur_diag::log_level() >= 1)
+		{
+			mirror_blur_diag::log_event_str("SetRT0", utils::va("rt=[%s]",
+				mirror_blur_diag::describe_surface(pRenderTarget)));
+		}
 		// v35.1: while HUD-RTT capture is active, intercept index-0 RT
 		// rebinds. The iw3 HUD pass starts with the engine binding the
 		// back-buffer (or its current pingpong) again right after the
@@ -1427,6 +1617,9 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::BeginScene()
 	{
+		// v38 diag: reset per-frame "present seen" latch so the very first
+		// EndScene/Present after this BeginScene re-emits the boundary marker.
+		mirror_blur_diag::on_begin_scene();
 		// r_mirrorViewmodel: belt-and-suspenders; ensure flag is clear at frame start
 		// so the world pass (first after BeginScene) renders with normal culling.
 		_renderer::mirror_viewmodel_active = false;
@@ -1702,9 +1895,12 @@ namespace components
 				// v36: only flip main DSV when the color flip itself succeeded.
 				// If the color flip failed, leaving depth untouched keeps color
 				// and depth in sync (same orientation as before this frame).
-				if (mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9))
+				const bool flip_ok_es = mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9);
+				mirror_blur_diag::log_event_str("flipBB", utils::va("site=EndScene2 ok=%d", flip_ok_es ? 1 : 0));
+				if (flip_ok_es)
 				{
 					mirror_rtt::do_main_depth_flip_if_enabled(m_pIDirect3DDevice9);
+					mirror_blur_diag::log_event_str("flipDSV", "site=EndScene2");
 				}
 			}
 		}
@@ -1737,6 +1933,13 @@ namespace components
 			else            { m_pIDirect3DDevice9->SetDepthStencilSurface(nullptr); }
 		}
 
+		// v38 diag: per-frame boundary fallback. Some iw3 dispatch paths
+		// route Present() around our wrapper. EndScene always reaches us;
+		// on_present() dedupes internally so we won't double-count when
+		// Present is also reached. This must be the LAST instrumented line
+		// in EndScene so all per-frame events are attributed to the closing
+		// frame, not the next one.
+		mirror_blur_diag::on_present("EndScene");
 		return m_pIDirect3DDevice9->EndScene();
 	}
 
@@ -1812,6 +2015,10 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value)
 	{
+		// v38.1 diagnostic: log render-state changes that may indicate
+		// HUD-start vs blur-composite boundary.
+		mirror_blur_diag::on_set_render_state(State, Value);
+
 		// v35.2: HUD-RTT capture fire. ALPHATESTENABLE=TRUE is the strong
 		// HUD-start signal in iw3 - post-FX quads (tonemap, color grade,
 		// additive glow) all run with alpha-test disabled, while real HUD
@@ -1958,6 +2165,12 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::SetTexture(DWORD Stage, IDirect3DBaseTexture9* pTexture)
 	{
+		// v38.1 diagnostic: log stage-0 texture changes after our v36 flip
+		// (level >= 2). Reveals which source textures feed the blur
+		// composite draws that produce the ghost.
+		if (Stage == 0)
+			mirror_blur_diag::on_set_texture0(pTexture);
+
 		// v35.15: classify stage-0 texture as 'big RT' (e.g. scene RT used
 		// by the damage/death post-FX pass). Drives the narrowed shader-
 		// escape in Draw[Indexed]Primitive. Normal HUD textures are
@@ -2094,6 +2307,7 @@ namespace components
 				"  DRAW raw prim=%u  follow=%d\n",
 				PrimitiveCount, _renderer::mirror_vscf_follow_remaining);
 		}
+		mirror_blur_diag::log_draw(m_pIDirect3DDevice9, "DrawPrim", PrimitiveCount, 0);
 		HRESULT hr = m_pIDirect3DDevice9->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
 		if (v35_14_escape_dp) {
 			m_pIDirect3DDevice9->SetRenderTarget(0, mirror_hud::g_color);
@@ -2120,9 +2334,12 @@ namespace components
 			// If the color flip failed, leaving depth untouched keeps color
 			// and depth in sync. HUD draws after this point but uses
 			// ZENABLE=FALSE, so flipping main DSV here is safe.
-			if (mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9))
+			const bool flip_ok = mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9);
+			mirror_blur_diag::log_event_str("flipBB", utils::va("site=postDraw ok=%d", flip_ok ? 1 : 0));
+			if (flip_ok)
 			{
 				mirror_rtt::do_main_depth_flip_if_enabled(m_pIDirect3DDevice9);
+				mirror_blur_diag::log_event_str("flipDSV", "site=postDraw");
 			}
 		}
 		// v35.2: HUD-RTT capture is no longer fired from DrawPrimitive.
@@ -2164,6 +2381,7 @@ namespace components
 				"  DRAW idx prim=%u nverts=%u  follow=%d\n",
 				primCount, NumVertices, _renderer::mirror_vscf_follow_remaining);
 		}
+		mirror_blur_diag::log_draw(m_pIDirect3DDevice9, "DrawIdx", primCount, NumVertices);
 		HRESULT hr = m_pIDirect3DDevice9->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
 		if (v35_14_escape_dip) {
 			m_pIDirect3DDevice9->SetRenderTarget(0, mirror_hud::g_color);
@@ -2193,9 +2411,12 @@ namespace components
 			// If the color flip failed, leaving depth untouched keeps color
 			// and depth in sync. HUD draws after this point but uses
 			// ZENABLE=FALSE, so flipping main DSV here is safe.
-			if (mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9))
+			const bool flip_ok = mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9);
+			mirror_blur_diag::log_event_str("flipBB", utils::va("site=postDraw ok=%d", flip_ok ? 1 : 0));
+			if (flip_ok)
 			{
 				mirror_rtt::do_main_depth_flip_if_enabled(m_pIDirect3DDevice9);
+				mirror_blur_diag::log_event_str("flipDSV", "site=postDraw");
 			}
 		}
 		// v35.2: HUD-RTT capture is no longer fired from DrawIndexedPrimitive.
@@ -2573,6 +2794,19 @@ namespace components
 		{
 			//Logger::Print("Invalid shader constant array!\n");
 			return D3DERR_INVALIDCALL;
+		}
+
+		if (StartRegister == 7 && Vector4fCount >= 1 && pConstantData
+			&& mirror_blur_diag::log_level() >= 1)
+		{
+			const float c70 = pConstantData[0];
+			const float c71 = pConstantData[1];
+			const float c72 = pConstantData[2];
+			const float c73 = pConstantData[3];
+			const bool fp = mirror_rtt::match_tonemap_signal(
+				m_pIDirect3DDevice9, c70, c71, c72, c73);
+			mirror_blur_diag::log_event_str("PSCF7", utils::va(
+				"c7=(%.4f,%.4f,%.4f,%.4f) fp=%d", c70, c71, c72, c73, fp ? 1 : 0));
 		}
 
 		if (_renderer::mirror_dump_active() && pConstantData)
