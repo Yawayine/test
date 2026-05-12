@@ -2035,6 +2035,29 @@ volatile bool _renderer::gun_seen_this_present = false;
 			/* maxVal	*/ 2,
 			/* flags	*/ game::dvar_flags::saved);
 
+		// v36: companion dvar for r_fullMirror that also horizontally flips
+		// the engine main depth-stencil after each back-buffer flip. ReShade's
+		// Generic Depth addon hijacks D3D9 CreateDepthStencilSurface and
+		// substitutes D24S8 with INTZ so MXAO/SSAO can sample depth as a
+		// texture. r_fullMirror only flips back-buffer COLOR; the depth read
+		// by ReShade stays in the original (non-mirrored) orientation, so AO
+		// gets computed on the original geometry and applied on the already-
+		// flipped color -- producing visible "ghost" shadows at mirror-wrong
+		// positions (e.g. faint gun outline floating on a wall). When this
+		// dvar is enabled, after every fullscreen color flip we also do a
+		// 2-pass pixel-shader pass that flips the main DSV horizontally so
+		// ReShade reads depth that matches the visible color and MXAO/SSAO
+		// occlusion lands at the correct positions. No-op when the main DSV
+		// is not INTZ (i.e. ReShade Generic Depth not active or unsupported
+		// by the driver) -- safe to leave on by default.
+		dvars::r_fullMirrorDepth = game::Dvar_RegisterInt(
+			/* name		*/ "r_fullMirrorDepth",
+			/* desc		*/ "v36: also horizontally flip the engine main depth-stencil after each r_fullMirror back-buffer flip so ReShade MXAO/SSAO (which samples depth via Generic Depth INTZ-hijack) computes occlusion in the mirrored coordinate space and AO lands at the correct positions on the flipped color. No-op if main DSV is not INTZ (ReShade Generic Depth not active). 0 = off. 1 = on (default).",
+			/* default	*/ 1,
+			/* minVal	*/ 0,
+			/* maxVal	*/ 1,
+			/* flags	*/ game::dvar_flags::saved);
+
 		// v33: ported from cod4mirror — fix MXAO/SSAO bleed-through on the
 		// mirrored gun. ReShade's MXAO samples the engine main depth-stencil
 		// to compute ambient occlusion. With r_mirrorViewmodel_rtt=1 the
@@ -2070,6 +2093,27 @@ volatile bool _renderer::gun_seen_this_present = false;
 			/* default	*/ 1,
 			/* minVal	*/ 0,
 			/* maxVal	*/ 1,
+			/* flags	*/ game::dvar_flags::saved);
+
+		// v39: workaround for gun disappearing under r_dof_tweak / r_dof_enable.
+		// Engine's DOF post-FX runs AFTER tonemap but BEFORE HUD; it reads
+		// main DSV depth and (because r_mirrorViewmodel_depthFix wrote z=0
+		// at gun pixels for MXAO/SSAO) treats every gun pixel as "infinitely
+		// out of focus", blurring the gun into the background and making it
+		// invisible. When mode > 0 the gun-RTT composite is deferred past the
+		// DOF pass to the HUD-start signal (same hook v38.2 uses for the
+		// r_fullMirror flip), so DOF sees only the world and the gun is then
+		// painted on top -- matching the engine's own late-viewmodel ordering
+		// when r_mirrorViewmodel_rtt=0. Trade-off: the gun no longer receives
+		// the engine's filmtweak/tonemap curve in this path; very extreme
+		// r_filmTweakBrightness / r_contrast / r_desaturation values may show
+		// a subtle tone difference between gun and world.
+		dvars::r_mirrorViewmodel_dofWorkaround = game::Dvar_RegisterInt(
+			/* name		*/ "r_mirrorViewmodel_dofWorkaround",
+			/* desc		*/ "v39: avoid gun-pixels being erased by the engine's depth-of-field post-FX. The engine's DOF pass runs AFTER tonemap but BEFORE HUD and reads main DSV depth (which v33 depth-fix wrote z=0 at gun pixels for MXAO/SSAO), so it treats gun pixels as 'extremely out of focus' and blurs them with neighbouring wall samples until the gun is invisible. This dvar defers the gun-RTT composite past the DOF pass when active. 0 = off (original v25 inject path; gun disappears under r_dof_tweak / r_dof_enable+ADS). 1 = check r_dof_tweak >= 1 only (default; fixes r_dof_tweak without ever bypassing filmtweak in non-DOF frames). 2 = check r_dof_tweak OR r_dof_enable >= 1 (also fixes r_dof_enable+ADS gun disappearing, at the cost of bypassing filmtweak on the gun in non-ADS frames when r_dof_enable defaults to 1). 3 = always defer (force late composite unconditionally; for diagnostics).",
+			/* default	*/ 1,
+			/* minVal	*/ 0,
+			/* maxVal	*/ 3,
 			/* flags	*/ game::dvar_flags::saved);
 
 		// v34: r_hudMirror = HUD-only horizontal mirror via 2D-ortho VSCF

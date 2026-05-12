@@ -104,6 +104,20 @@ Blend-мод композ-итa. Default `2` = ONE/ONE additive, обычно п
 - `1` — flip всего back-buffer'а **до HUD**. Мир + ваш зеркальный gun отражаются вместе, HUD не трогается. С `r_mirrorViewmodel_rtt 1` оружие флипается дважды → визуально оказывается справа в перевёрнутом мире.
 - `2` — flip всего кадра **в EndScene**, после HUD. Мирror всё включая HUD. Простой "перевернуть всю запись" режим.
 
+#### `r_fullMirrorDepth` (0/1, default 1) — NEW v36
+**Совместимость `r_fullMirror` с ReShade MXAO/SSAO/RTGI.**
+
+`r_fullMirror` флипает только **color** back-buffer'а; main depth-stencil остаётся в исходной (нефлипнутой) ориентации. ReShade Generic Depth (D3D9) перехватывает `CreateDepthStencilSurface` и подменяет `D24S8 → INTZ` для того, чтобы MXAO/SSAO могли семплить depth как текстуру. С нефлипнутой depth и флипнутым color MXAO рассчитывает occlusion в исходных позициях геометрии и накладывает darkening поверх **уже отзеркалённого** color → видны "призраки" теней в зеркально-неправильных позициях (например, бледный контур оружия плавающий на стене).
+
+При `r_fullMirrorDepth 1` (default) после каждого color flip'а делаем дополнительный 2-pass pixel-shader pass который горизонтально флипает main DSV. ReShade EndScene/Present hook срабатывает после нашего EndScene, поэтому MXAO читает уже флипнутую depth и считает occlusion в координатах, совпадающих с видимым (флипнутым) color — призраки исчезают.
+
+- `0` — выключить depth flip (старое поведение v32–v35).
+- `1` — включить depth flip (default, безопасно).
+
+**Безопасность.** Если ReShade Generic Depth не загружен или main DSV не INTZ-формата (фолбек для драйверов без поддержки FOURCC INTZ), функция silently возвращает false — depth не трогается, никаких артефактов. То есть dvar безопасно держать в `1` всегда.
+
+**Производительность.** Два fullscreen quad'а с тривиальным PS (1 texld + 1 mov oDepth). Накладные расходы пренебрежимо малы.
+
 ### Старый matrix-flip пайплайн (для справки)
 До RTT был matrix-flip путь — менялся знак столбца projection-матрицы. Производил left-handed геометрию, ломал нормали. Оставлен для отладки.
 
@@ -212,3 +226,7 @@ Blend-мод композ-итa. Default `2` = ONE/ONE additive, обычно п
 | v29 | trampoline 8 байт (фикс краша на стрельбе) |
 | v31 | RH-mirror axis mode 2 (фикс дрейфа гильз при повороте) |
 | v32 | `r_fullMirror` для полного flip-а кадра |
+| v33 | `r_mirrorViewmodel_depthFix` / `r_mirrorViewmodel_clearRttDepth` — фикс ghost MXAO на зеркальном гуне |
+| v35 | `r_hudMirror` — отдельный HUD-mirror через RTT (совместим с ReShade Flip.fx) |
+| v36 | `r_fullMirrorDepth` — flip main DSV вслед за color при `r_fullMirror 1/2` (фикс ghost MXAO/SSAO в ReShade) |
+| v37 | расширенный PSCF c7 fingerprint + RGB-gated PS-pointer cache — гун снова получает filmtweak/grading при произвольных `r_filmTweakBrightness/Contrast/Desaturation`, `r_contrast`, `r_desaturation`, включая комбо за расширенными границами. Эволюция: v37.0 — cache без проверки RGB → ghost на fullMirror/hudMirror; v37.1 — cache снят → экзотические комбо снова отваливались; **v37.2** — cache возвращён, но требует `c70==c71==c72` в fallback-ветке → secondary post-FX пассы с `(3.78,4.00,3.56,1.00)` корректно отвергаются |
