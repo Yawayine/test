@@ -97,6 +97,93 @@ namespace components
 		static int  g_flip_w                     = 0;
 		static int  g_flip_h                     = 0;
 		static bool g_pending_fullmirror_flip    = false; // set on PSCF c7 fingerprint when fullMirror==1; fires AFTER the next draw
+		// v38.2: deferred (HUD-start-gated) flip path. When r_blur > 0 the
+		// engine runs ~4 motion-blur composite draws AFTER the tonemap pass
+		// but BEFORE the HUD pass. Those draws read from blur history
+		// textures captured pre-flip, so compositing them onto the already-
+		// flipped BB produces a non-mirrored ghost layer (visible at
+		// r_fullMirror==1).
+		//
+		// v38 (PR #8) tried to fire the deferred flip on the first
+		// D3DRS_ALPHATESTENABLE=TRUE after PSCF c7. That was wrong: the
+		// motion-blur composite *also* toggles ALPHATESTENABLE on/off
+		// (confirmed by PR #7 v38.1 diagnostic logs), so the flip fired
+		// inside the blur composite -- BEFORE the harmful draws -- and
+		// produced no benefit.
+		//
+		// v38.2: the engine's real HUD-start in iw3 is not just "ATE=1" but
+		// a 4-state SEQUENCE that always appears together at HUD-start and
+		// never appears together during blur composite or post-FX:
+		//     CULLMODE=1, ALPHABLENDENABLE=1, SRCBLEND=2, ALPHATESTENABLE=1
+		// All four are set within consecutive SetRenderState calls right
+		// before HUD draws begin. We shadow-track CULL/ABE/SB and watch
+		// for the ATE 0->1 transition; if the shadow state matches the
+		// HUD signature at that moment, this is real HUD-start.
+		//
+		// If EndScene fires without HUD ever arriving (menu / console with
+		// no HUD), flush in EndScene as a fallback (matches r_fullMirror==2
+		// behaviour for that frame).
+		static bool g_pending_fullmirror_flip_hud_gated = false;
+
+		// v37.2: pixel-shader-pointer cache for the engine's post-FX tonemap pass.
+		// Latched on the FIRST successful structural match; used as a fallback
+		// when the dvar settings push c7 outside even the widened structural
+		// bounds. Weak reference (no AddRef), cleared on Reset(). Stale-pointer
+		// comparisons are safe (numeric compare only, never dereferenced).
+		static IDirect3DPixelShader9* g_tonemap_ps_cache = nullptr;
+
+		// v37.2: tonemap-pass fingerprint - structural part only.
+		// Same RGB on c70..c72, c70 slightly negative, c73 a positive gamma
+		// exponent. Earlier bounds (-0.2<c70<0, 1<c73<5) were derived from
+		// default film tweak settings only; the engine drives c7 from
+		// r_contrast (-> c70) and r_desaturation (-> c73), so any non-default
+		// setting moved c7 outside those bounds and broke detection.
+		// Widened bounds capture all dvar combos observed in PR #4 diagnostics
+		// (default: c70=-0.066/c73=2.77; r_contrast=2: c70=-0.766; r_desaturation=0:
+		// c73=13.24) with margin.
+		static inline bool match_tonemap_structural(float c70, float c71, float c72, float c73)
+		{
+			auto fapprox_eq = [](float a, float b) { float d = a - b; if (d < 0) d = -d; return d < 1e-4f; };
+			return c70 < 0.0f && c70 > -1.5f
+				&& fapprox_eq(c70, c71) && fapprox_eq(c70, c72)
+				&& c73 > 0.5f && c73 < 20.0f;
+		}
+
+		// v37.2: tonemap signal = structural match OR (cached PS + RGB equality).
+		// The cache fallback exists because users can push r_contrast / r_desaturation
+		// far enough to move c7 outside the widened structural bounds. v37.0 made
+		// the cache fallback unconditional on c7 shape, which caused over-detection
+		// on r_fullMirror==1 and r_hudMirror==1: the engine reuses the tonemap PS
+		// for secondary post-FX passes (sun fade / colour grade) that upload
+		// c7=(3.78,4.00,3.56,1.00) - different RGB per component, structurally not
+		// a tonemap signal, but the cache matched on PS pointer alone and produced
+		// translucent ghosts. v37.2 keeps the cache but ALSO requires c70==c71==c72
+		// in the cache branch, so the secondary passes (which use distinct per-mesh
+		// lighting constants with non-equal RGB) are correctly rejected.
+		static inline bool match_tonemap_signal(IDirect3DDevice9* dev,
+			float c70, float c71, float c72, float c73)
+		{
+			auto fapprox_eq = [](float a, float b) { float d = a - b; if (d < 0) d = -d; return d < 1e-4f; };
+			const bool same_rgb = fapprox_eq(c70, c71) && fapprox_eq(c70, c72);
+			const bool structural = match_tonemap_structural(c70, c71, c72, c73);
+			if (!dev) return structural;
+			IDirect3DPixelShader9* cur = nullptr;
+			if (FAILED(dev->GetPixelShader(&cur))) return structural;
+			bool result = structural;
+			if (structural)
+			{
+				if (!g_tonemap_ps_cache && cur) g_tonemap_ps_cache = cur; // weak ref, latch on first hit
+			}
+			else if (same_rgb && cur && cur == g_tonemap_ps_cache)
+			{
+				// cache fallback - RGB equality REQUIRED so per-mesh lighting
+				// constants (3.78,4.00,3.56,1.00) are rejected even though they
+				// may share the cached PS pointer with the real tonemap pass.
+				result = true;
+			}
+			if (cur) cur->Release();
+			return result;
+		}
 
 		static void release_targets()
 		{
@@ -609,6 +696,244 @@ namespace components
 			return ok;
 		}
 
+		// ----------------------------------------------------------------
+		// v36: main depth-stencil horizontal flip companion to do_fullscreen_flip.
+		//
+		// Problem. r_fullMirror only flips back-buffer COLOR via StretchRect +
+		// UV-flipped fullscreen quad. The engine main depth-stencil stays in
+		// its original orientation. ReShade Generic Depth (D3D9 path) hijacks
+		// CreateDepthStencilSurface and substitutes D24S8 with the FOURCC INTZ
+		// format so MXAO/SSAO can sample depth as a texture. With non-flipped
+		// depth and flipped color, MXAO computes ambient occlusion at the
+		// ORIGINAL geometry positions and applies darkening on top of the
+		// MIRRORED color -- producing visible "ghost" AO at mirror-wrong
+		// positions (e.g. faint gun outline floating on a wall).
+		//
+		// Fix. After every fullscreen color flip, also horizontally flip the
+		// engine main depth-stencil itself. Two passes are required because
+		// D3D9 disallows binding the same depth-stencil texture as both an
+		// input sampler and the output DSV in the same draw:
+		//
+		//   Pass 1: read main DSV's INTZ texture with FLIPPED UVs, output
+		//           depth into a scratch INTZ surface.
+		//   Pass 2: read scratch INTZ with STRAIGHT UVs, output depth back
+		//           into the main DSV. Main DSV now contains horizontally
+		//           flipped depth.
+		//
+		// ReShade EndScene/Present hook fires AFTER our wrapper's EndScene,
+		// so by the time ReShade samples depth for MXAO it sees the flipped
+		// version that matches the visible (flipped) color.
+		//
+		// No-op safety. If GetContainer on main DSV fails, or the parent
+		// texture's format is not INTZ (i.e. ReShade Generic Depth not loaded
+		// or running on a driver/path that does not perform the INTZ
+		// substitution), the function silently returns false and leaves depth
+		// untouched. r_fullMirrorDepth defaults to 1 -- safe to leave on.
+		// ----------------------------------------------------------------
+
+		static const D3DFORMAT FOURCC_INTZ = (D3DFORMAT)MAKEFOURCC('I','N','T','Z');
+
+		static IDirect3DTexture9*     g_depth_flip_intz = nullptr; // scratch INTZ for ping-pong
+		static IDirect3DSurface9*     g_depth_flip_surf = nullptr; // INTZ level-0 surface as DSV
+		static IDirect3DPixelShader9* g_depth_copy_ps   = nullptr; // ps_2_0: oDepth = sample.x
+		static int  g_depth_flip_w   = 0;
+		static int  g_depth_flip_h   = 0;
+		static bool g_depth_flip_ps_compile_failed = false; // sticky -- don't retry per frame
+
+		static void release_depth_flip_resources()
+		{
+			if (g_depth_flip_surf) { g_depth_flip_surf->Release(); g_depth_flip_surf = nullptr; }
+			if (g_depth_flip_intz) { g_depth_flip_intz->Release(); g_depth_flip_intz = nullptr; }
+			if (g_depth_copy_ps)   { g_depth_copy_ps->Release();   g_depth_copy_ps   = nullptr; }
+			g_depth_flip_w = g_depth_flip_h = 0;
+			g_depth_flip_ps_compile_failed = false;
+		}
+
+		static bool ensure_depth_flip_intz(IDirect3DDevice9* dev, UINT w, UINT h)
+		{
+			if (g_depth_flip_intz && (int)w == g_depth_flip_w && (int)h == g_depth_flip_h) return true;
+			if (g_depth_flip_surf) { g_depth_flip_surf->Release(); g_depth_flip_surf = nullptr; }
+			if (g_depth_flip_intz) { g_depth_flip_intz->Release(); g_depth_flip_intz = nullptr; }
+			g_depth_flip_w = g_depth_flip_h = 0;
+			if (FAILED(dev->CreateTexture(w, h, 1, D3DUSAGE_DEPTHSTENCIL,
+				FOURCC_INTZ, D3DPOOL_DEFAULT, &g_depth_flip_intz, nullptr))) return false;
+			if (FAILED(g_depth_flip_intz->GetSurfaceLevel(0, &g_depth_flip_surf)))
+			{
+				g_depth_flip_intz->Release(); g_depth_flip_intz = nullptr;
+				return false;
+			}
+			g_depth_flip_w = (int)w;
+			g_depth_flip_h = (int)h;
+			return true;
+		}
+
+		static bool ensure_depth_copy_ps(IDirect3DDevice9* dev)
+		{
+			if (g_depth_copy_ps) return true;
+			if (g_depth_flip_ps_compile_failed) return false;
+
+			// ps_2_0: sample input texture at TEXCOORD0, write the red channel
+			// (= INTZ depth value) to oDepth. oC0 is required by the PS 2.0
+			// linker even though COLORWRITE is masked out in our state setup.
+			static const char* asm_src =
+				"ps_2_0\n"
+				"dcl_2d s0\n"
+				"dcl t0.xy\n"
+				"texld r0, t0, s0\n"
+				"mov oC0, r0\n"
+				"mov oDepth, r0.x\n";
+
+			ID3DXBuffer* code   = nullptr;
+			ID3DXBuffer* errors = nullptr;
+			HRESULT hr = D3DXAssembleShader(asm_src, (UINT)strlen(asm_src), nullptr, nullptr, 0, &code, &errors);
+			if (errors) errors->Release();
+			if (FAILED(hr) || !code)
+			{
+				g_depth_flip_ps_compile_failed = true;
+				return false;
+			}
+			hr = dev->CreatePixelShader((const DWORD*)code->GetBufferPointer(), &g_depth_copy_ps);
+			code->Release();
+			if (FAILED(hr) || !g_depth_copy_ps)
+			{
+				g_depth_flip_ps_compile_failed = true;
+				return false;
+			}
+			return true;
+		}
+
+		// Returns true and AddRef's *out_tex iff the given DSV's parent is
+		// an INTZ-backed IDirect3DTexture9. Caller must Release.
+		static bool get_main_dsv_intz_texture(IDirect3DSurface9* dsv, IDirect3DTexture9** out_tex)
+		{
+			if (!dsv || !out_tex) return false;
+			*out_tex = nullptr;
+			IDirect3DTexture9* tex = nullptr;
+			if (FAILED(dsv->GetContainer(__uuidof(IDirect3DTexture9), (void**)&tex)) || !tex) return false;
+			D3DSURFACE_DESC sd;
+			if (FAILED(tex->GetLevelDesc(0, &sd)) || sd.Format != FOURCC_INTZ)
+			{
+				tex->Release();
+				return false;
+			}
+			*out_tex = tex;
+			return true;
+		}
+
+		static bool do_main_depth_flip(IDirect3DDevice9* dev)
+		{
+			IDirect3DSurface9* main_dsv = nullptr;
+			if (FAILED(dev->GetDepthStencilSurface(&main_dsv)) || !main_dsv) return false;
+
+			IDirect3DTexture9* main_dsv_tex = nullptr;
+			if (!get_main_dsv_intz_texture(main_dsv, &main_dsv_tex))
+			{
+				main_dsv->Release();
+				return false;
+			}
+
+			D3DSURFACE_DESC dsv_desc;
+			main_dsv->GetDesc(&dsv_desc);
+
+			if (!ensure_depth_flip_intz(dev, dsv_desc.Width, dsv_desc.Height) ||
+				!ensure_depth_copy_ps(dev))
+			{
+				main_dsv_tex->Release();
+				main_dsv->Release();
+				return false;
+			}
+
+			IDirect3DSurface9*    prev_color = nullptr;
+			IDirect3DStateBlock9* sb         = nullptr;
+			if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb))) sb = nullptr;
+			if (FAILED(dev->GetRenderTarget(0, &prev_color))) prev_color = nullptr;
+
+			// Common state for both passes: ZWRITE only, ALWAYS pass, point
+			// sampling, COLORWRITE=0 (oC0 is written but masked out so we
+			// don't disturb whatever color happens to be bound on the RT).
+			auto set_common_state = [&]()
+			{
+				dev->SetVertexShader(nullptr);
+				dev->SetPixelShader(g_depth_copy_ps);
+				dev->SetVertexDeclaration(nullptr);
+				dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+				dev->SetRenderState(D3DRS_ZENABLE,           TRUE);
+				dev->SetRenderState(D3DRS_ZWRITEENABLE,      TRUE);
+				dev->SetRenderState(D3DRS_ZFUNC,             D3DCMP_ALWAYS);
+				dev->SetRenderState(D3DRS_CULLMODE,          D3DCULL_NONE);
+				dev->SetRenderState(D3DRS_LIGHTING,          FALSE);
+				dev->SetRenderState(D3DRS_FOGENABLE,         FALSE);
+				dev->SetRenderState(D3DRS_ALPHABLENDENABLE,  FALSE);
+				dev->SetRenderState(D3DRS_ALPHATESTENABLE,   FALSE);
+				dev->SetRenderState(D3DRS_STENCILENABLE,     FALSE);
+				dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+				dev->SetRenderState(D3DRS_SRGBWRITEENABLE,   FALSE);
+				dev->SetRenderState(D3DRS_COLORWRITEENABLE,  0);
+				dev->SetSamplerState(0, D3DSAMP_MINFILTER,   D3DTEXF_POINT);
+				dev->SetSamplerState(0, D3DSAMP_MAGFILTER,   D3DTEXF_POINT);
+				dev->SetSamplerState(0, D3DSAMP_ADDRESSU,    D3DTADDRESS_CLAMP);
+				dev->SetSamplerState(0, D3DSAMP_ADDRESSV,    D3DTADDRESS_CLAMP);
+				dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+			};
+
+			const float W = (float)dsv_desc.Width;
+			const float H = (float)dsv_desc.Height;
+			struct V { float x, y, z, rhw, u, v; };
+
+			// Pass 1: main INTZ -> scratch INTZ with HORIZONTALLY FLIPPED UVs.
+			// Bind scratch INTZ as DSV. RT stays as prev_color (BB) which has
+			// matching dimensions; COLORWRITE=0 so it isn't touched.
+			dev->SetDepthStencilSurface(g_depth_flip_surf);
+			set_common_state();
+			dev->SetTexture(0, main_dsv_tex);
+			{
+				V quad[4] = {
+					{ -0.5f,    -0.5f,    0.0f, 1.0f, 1.0f, 0.0f },
+					{  W-0.5f,  -0.5f,    0.0f, 1.0f, 0.0f, 0.0f },
+					{ -0.5f,     H-0.5f,  0.0f, 1.0f, 1.0f, 1.0f },
+					{  W-0.5f,   H-0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
+				};
+				dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+			}
+
+			// Pass 2: scratch INTZ -> main DSV with STRAIGHT UVs. The flip
+			// already happened in pass 1; pass 2 just blits it back.
+			dev->SetDepthStencilSurface(main_dsv);
+			set_common_state();
+			dev->SetTexture(0, g_depth_flip_intz);
+			{
+				V quad[4] = {
+					{ -0.5f,    -0.5f,    0.0f, 1.0f, 0.0f, 0.0f },
+					{  W-0.5f,  -0.5f,    0.0f, 1.0f, 1.0f, 0.0f },
+					{ -0.5f,     H-0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
+					{  W-0.5f,   H-0.5f,  0.0f, 1.0f, 1.0f, 1.0f },
+				};
+				dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+			}
+
+			// Always release the depth texture binding so we don't leave a
+			// depth-stencil texture sampled on s0 for subsequent draws.
+			dev->SetTexture(0, nullptr);
+
+			// State block restores everything else (incl. shaders, RS, samplers,
+			// FVF, depth-stencil surface). RT is not captured by state blocks
+			// so we restore it explicitly.
+			if (prev_color) { dev->SetRenderTarget(0, prev_color); }
+			if (sb) { sb->Apply(); sb->Release(); }
+			if (prev_color) { prev_color->Release(); }
+			main_dsv_tex->Release();
+			main_dsv->Release();
+			return true;
+		}
+
+		// Wrapper: call after each do_fullscreen_flip when r_fullMirrorDepth is on.
+		static inline void do_main_depth_flip_if_enabled(IDirect3DDevice9* dev)
+		{
+			if (!dvars::r_fullMirrorDepth) return;
+			if (dvars::r_fullMirrorDepth->current.integer == 0) return;
+			do_main_depth_flip(dev);
+		}
+
 		static void on_device_reset()
 		{
 			if (g_saved_color) { g_saved_color->Release(); g_saved_color = nullptr; }
@@ -617,8 +942,64 @@ namespace components
 			g_in_segment             = false;
 			g_pending_early_composite = false;
 			g_pending_fullmirror_flip = false;
+			g_pending_fullmirror_flip_hud_gated = false; // v38: blur fix
+			g_tonemap_ps_cache       = nullptr; // v37.2: weak ref, drop on device reset
 			release_targets();
 			release_flip_target();
+			release_depth_flip_resources();
+		}
+	}
+
+	// ----------------------------------------------------------------------
+	// v38.2: HUD-start detector. Shadows the four render states whose joint
+	// transition uniquely identifies the engine's HUD-pass start in iw3:
+	//
+	//     CULLMODE=1, ALPHABLENDENABLE=1, SRCBLEND=2, ALPHATESTENABLE=1 (rising)
+	//
+	// PR #7 diagnostic logs confirmed this signature is present at HUD-start
+	// in BOTH r_blur=0 and r_blur=1 frames, and is NOT present at any of the
+	// motion-blur composite ATE rising edges (those happen with CULL=3,
+	// ABE=0, SB=5 from the immediately preceding post-FX/blur pass). This
+	// is what replaces v38's broken "first ATE=1 after PSCF c7" trigger.
+	//
+	// Behaviour: observe() is called for every SetRenderState. Internally
+	// it updates the shadow value for CULL/ABE/SB/ATE. When ATE rises
+	// 0 -> 1 and the other three shadows are exactly the HUD-start values,
+	// observe() returns true once for that transition.
+	//
+	// No per-frame reset is needed: the engine sets ATE/CULL/ABE/SB many
+	// times per frame, so the shadow values follow the engine reliably.
+	// ----------------------------------------------------------------------
+	namespace hud_start_detect
+	{
+		static DWORD g_shadow_cull = 3;  // D3DCULL_CW default
+		static DWORD g_shadow_abe  = 0;
+		static DWORD g_shadow_sb   = D3DBLEND_ONE;
+		static DWORD g_shadow_ate  = 0;
+
+		// observe a SetRenderState call BEFORE it is forwarded to the
+		// device. returns true iff this call is the ATE 0->1 rising edge
+		// that completes the HUD-start signature.
+		static bool observe(D3DRENDERSTATETYPE State, DWORD Value)
+		{
+			bool fired = false;
+			switch (State)
+			{
+			case D3DRS_CULLMODE:         g_shadow_cull = Value; break;
+			case D3DRS_ALPHABLENDENABLE: g_shadow_abe  = Value; break;
+			case D3DRS_SRCBLEND:         g_shadow_sb   = Value; break;
+			case D3DRS_ALPHATESTENABLE:
+				if (Value != 0 && g_shadow_ate == 0)
+				{
+					fired = (g_shadow_cull == 1
+						&& g_shadow_abe != 0
+						&& g_shadow_sb == 2);
+				}
+				g_shadow_ate = Value;
+				break;
+			default: break;
+			}
+			return fired;
 		}
 	}
 
@@ -1397,7 +1778,31 @@ namespace components
 		{
 			const int full_mirror_eos = dvars::r_fullMirror
 				? dvars::r_fullMirror->current.integer : 0;
-			if (full_mirror_eos == 2) mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9);
+			if (full_mirror_eos == 2)
+			{
+				// v36: only flip main DSV when the color flip itself succeeded.
+				// If the color flip failed, leaving depth untouched keeps color
+				// and depth in sync (same orientation as before this frame).
+				if (mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9))
+				{
+					mirror_rtt::do_main_depth_flip_if_enabled(m_pIDirect3DDevice9);
+				}
+			}
+		}
+
+		// v38: EndScene fallback for the HUD-gated fullMirror flip path.
+		// If we armed the HUD-gated flip earlier (r_blur != 0 && r_fullMirror == 1)
+		// and the frame ended without an ALPHATESTENABLE=TRUE ever firing
+		// (e.g. menu/console frame with no HUD draws), the BB would otherwise
+		// stay un-mirrored. Flush the deferred flip here as a last resort
+		// so the user always sees the mirrored world for this frame.
+		if (mirror_rtt::g_pending_fullmirror_flip_hud_gated)
+		{
+			mirror_rtt::g_pending_fullmirror_flip_hud_gated = false;
+			if (mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9))
+			{
+				mirror_rtt::do_main_depth_flip_if_enabled(m_pIDirect3DDevice9);
+			}
 		}
 
 		// v33 (ported from cod4mirror): clear our off-screen RTT
@@ -1503,6 +1908,13 @@ namespace components
 
 	HRESULT d3d9ex::D3D9Device::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value)
 	{
+		// v38.2: shadow-state HUD-start detector observes ALL SetRenderState
+		// calls and returns true exactly once per frame on the iw3 HUD-start
+		// signature (CULLMODE=1, ALPHABLENDENABLE=1, SRCBLEND=2, then ATE 0->1).
+		// This replaces v38's broken "first ATE=1 after PSCF c7" trigger which
+		// also fired inside the motion-blur composite.
+		const bool hud_start_fired = hud_start_detect::observe(State, Value);
+
 		// v35.2: HUD-RTT capture fire. ALPHATESTENABLE=TRUE is the strong
 		// HUD-start signal in iw3 - post-FX quads (tonemap, color grade,
 		// additive glow) all run with alpha-test disabled, while real HUD
@@ -1538,7 +1950,14 @@ namespace components
 		// On the firing side just fire on the next ALPHATESTENABLE=TRUE,
 		// which by construction is the start of the real HUD pass
 		// (post-FX quads in iw3 run with alpha-test disabled).
-		if (State == D3DRS_ALPHATESTENABLE && Value
+		//
+		// v38.2: replace bare "ATE=TRUE" with the shadow-state HUD signature.
+		// Without this, motion-blur composite (which sets ATE=1 briefly)
+		// would start HUD-RTT capture too early -- HUD-RTT then catches the
+		// blur composite draws AND the HUD, and composite() flips both, so
+		// the mirrored blur layer ends up on screen (ghost). User saw this
+		// at r_hudMirror==1 + r_blur==1.
+		if (hud_start_fired
 			&& mirror_hud::g_capture_armed && !mirror_hud::g_active)
 		{
 			mirror_hud::g_capture_armed = false;
@@ -1553,6 +1972,22 @@ namespace components
 					mirror_hud::g_alphatest_fires_this_frame,
 					mirror_hud::g_begin_calls_this_frame), 0);
 			}
+		}
+
+		// v38.2: HUD-start-gated fullMirror flip fire (re-using the same
+		// shadow-state HUD-start signal as r_hudMirror, computed at top of
+		// this function). Firing the BB flip here means it lands AFTER the
+		// motion-blur composite (which reads from history textures captured
+		// pre-flip) but BEFORE HUD, preserving the r_fullMirror==1 contract
+		// that HUD stays un-mirrored. v38 (PR #8) used bare ATE=TRUE here
+		// and so fired inside the blur composite -- this fixes that.
+		if (hud_start_fired
+			&& mirror_rtt::g_pending_fullmirror_flip_hud_gated)
+		{
+			mirror_rtt::g_pending_fullmirror_flip_hud_gated = false;
+			const bool flip_ok = mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9);
+			if (flip_ok)
+				mirror_rtt::do_main_depth_flip_if_enabled(m_pIDirect3DDevice9);
 		}
 		// v35.20: SetRenderState override removed -- v35.19 log showed
 		// ablend_ovr=0 every frame because the engine sets SRCBLENDALPHA
@@ -1807,7 +2242,14 @@ namespace components
 		if (mirror_rtt::g_pending_fullmirror_flip)
 		{
 			mirror_rtt::g_pending_fullmirror_flip = false;
-			mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9);
+			// v36: only flip main DSV when the color flip itself succeeded.
+			// If the color flip failed, leaving depth untouched keeps color
+			// and depth in sync. HUD draws after this point but uses
+			// ZENABLE=FALSE, so flipping main DSV here is safe.
+			if (mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9))
+			{
+				mirror_rtt::do_main_depth_flip_if_enabled(m_pIDirect3DDevice9);
+			}
 		}
 		// v35.2: HUD-RTT capture is no longer fired from DrawPrimitive.
 		// PSCF c7 only ARMS capture; the actual fire is deferred to the
@@ -1873,7 +2315,14 @@ namespace components
 		if (mirror_rtt::g_pending_fullmirror_flip)
 		{
 			mirror_rtt::g_pending_fullmirror_flip = false;
-			mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9);
+			// v36: only flip main DSV when the color flip itself succeeded.
+			// If the color flip failed, leaving depth untouched keeps color
+			// and depth in sync. HUD draws after this point but uses
+			// ZENABLE=FALSE, so flipping main DSV here is safe.
+			if (mirror_rtt::do_fullscreen_flip(m_pIDirect3DDevice9))
+			{
+				mirror_rtt::do_main_depth_flip_if_enabled(m_pIDirect3DDevice9);
+			}
 		}
 		// v35.2: HUD-RTT capture is no longer fired from DrawIndexedPrimitive.
 		// PSCF c7 only ARMS capture; the actual fire is deferred to the
@@ -2293,19 +2742,17 @@ namespace components
 			const float c71 = pConstantData[1];
 			const float c72 = pConstantData[2];
 			const float c73 = pConstantData[3];
-			// v23: generalized tonemap-shader fingerprint. The exact values shift
-			// based on the engine's gamma/exposure setting (live match observed
-			// (-0.066, -0.066, -0.066, 2.773585), demo replay observed
-			// (-0.013772, -0.013772, -0.013772, 1.222222)) but the STRUCTURE is
-			// the same: the first three components are equal and slightly
-			// negative, the fourth is the gamma exponent in [1.0, 5.0]. This
-			// shape is unique to the final tonemap technique and never appears
-			// in stencil-shadow / post-FX bloom / world / viewmodel passes.
-			auto fapprox_eq = [](float a, float b) { float d = a - b; if (d < 0) d = -d; return d < 1e-4f; };
-			const bool is_pre_hud_signal =
-				c70 < 0.0f && c70 > -0.2f &&
-				fapprox_eq(c70, c71) && fapprox_eq(c70, c72) &&
-				c73 > 1.0f && c73 < 5.0f;
+			// v23/v37: generalized tonemap-shader fingerprint. The exact values
+			// shift based on the engine's gamma/exposure/grading dvars (default
+			// (-0.066,-0.066,-0.066, 2.773585); demo replay (-0.013772,...,1.222222);
+			// r_desaturation=0 -> c73~13.24; r_contrast=2 -> c70~-0.766) but the
+			// STRUCTURE is the same: c70..c72 equal and negative, c73 a positive
+			// gamma-exponent. v37 widens bounds AND caches the pixel-shader
+			// pointer on first structural match so extreme film tweak settings
+			// (r_filmTweakBrightness/Contrast/Desaturation, r_contrast,
+			// r_desaturation) no longer break detection.
+			const bool is_pre_hud_signal = mirror_rtt::match_tonemap_signal(
+				m_pIDirect3DDevice9, c70, c71, c72, c73);
 			if (is_pre_hud_signal)
 			{
 				// v33 (ported from cod4mirror): rewrite main depth at the
@@ -2358,12 +2805,25 @@ namespace components
 				const float c71 = pConstantData[1];
 				const float c72 = pConstantData[2];
 				const float c73 = pConstantData[3];
-				auto fapprox_eq = [](float a, float b) { float d = a - b; if (d < 0) d = -d; return d < 1e-4f; };
-				const bool is_pre_hud_signal =
-					c70 < 0.0f && c70 > -0.2f &&
-					fapprox_eq(c70, c71) && fapprox_eq(c70, c72) &&
-					c73 > 1.0f && c73 < 5.0f;
-				if (is_pre_hud_signal) mirror_rtt::g_pending_fullmirror_flip = true;
+				// v37: widened bounds + PS-pointer cache fallback so r_fullMirror
+				// also survives extreme r_contrast / r_desaturation values.
+				const bool is_pre_hud_signal = mirror_rtt::match_tonemap_signal(
+					m_pIDirect3DDevice9, c70, c71, c72, c73);
+				if (is_pre_hud_signal)
+				{
+					// v38: when motion blur is enabled, route the flip through
+					// the HUD-gated path so it fires AFTER the blur composite
+					// (which runs between tonemap and HUD). Without this gate
+					// the flip lands BEFORE blur composite -> blur draws from
+					// pre-flip history textures and produces a non-mirrored
+					// ghost layer over the flipped BB.
+					game::dvar_s* d_blur = game::Dvar_FindVar("r_blur");
+					const bool blur_on = d_blur && d_blur->current.value > 0.0f;
+					if (blur_on)
+						mirror_rtt::g_pending_fullmirror_flip_hud_gated = true;
+					else
+						mirror_rtt::g_pending_fullmirror_flip = true;
+				}
 			}
 		}
 
@@ -2383,11 +2843,10 @@ namespace components
 				const float c71 = pConstantData[1];
 				const float c72 = pConstantData[2];
 				const float c73 = pConstantData[3];
-				auto fapprox_eq = [](float a, float b) { float d = a - b; if (d < 0) d = -d; return d < 1e-4f; };
-				const bool is_pre_hud_signal =
-					c70 < 0.0f && c70 > -0.2f &&
-					fapprox_eq(c70, c71) && fapprox_eq(c70, c72) &&
-					c73 > 1.0f && c73 < 5.0f;
+				// v37: widened bounds + PS-pointer cache fallback so r_hudMirror
+				// also survives extreme r_contrast / r_desaturation values.
+				const bool is_pre_hud_signal = mirror_rtt::match_tonemap_signal(
+					m_pIDirect3DDevice9, c70, c71, c72, c73);
 				// v35.8: gate arming on mirror_rtt::g_dhp_seen_this_frame.
 				// In damage-flash frames the engine emits an early c7
 				// match BEFORE the gun pass starts (during damage-overlay
